@@ -15,7 +15,7 @@
  * FormData 멀티파트 오버헤드(boundary, headers 등) 약 수백 바이트 고려
  * → Blob 자체는 3.5MB 이하로 제한하면 충분히 안전
  */
-const MAX_CHUNK_BLOB_BYTES = 3.5 * 1024 * 1024; // 3.5MB
+const MAX_CHUNK_BLOB_BYTES = 1 * 1024 * 1024; // 1MB — 안전하게 Vercel 4.5MB 한도 이내
 
 /**
  * 1초 단위 data chunk 배열을 크기 기반으로 Blob 배열로 묶기.
@@ -74,6 +74,60 @@ export async function safeParseErrorResponse(res: Response): Promise<string> {
     }
   } catch {
     return `서버 오류 (${res.status})`;
+  }
+}
+
+/**
+ * fetch 응답을 안전하게 JSON으로 파싱.
+ * Vercel/CDN이 비표준 응답(텍스트, HTML 등)을 반환할 수 있으므로
+ * 항상 text()로 먼저 읽고 JSON.parse를 시도합니다.
+ */
+export async function safeParseJson<T = Record<string, unknown>>(
+  res: Response
+): Promise<{ ok: true; data: T } | { ok: false; error: string; status: number }> {
+  const text = await res.text();
+
+  // HTTP 에러인 경우
+  if (!res.ok) {
+    try {
+      const json = JSON.parse(text);
+      return {
+        ok: false,
+        error: json.error || json.message || `서버 오류 (${res.status})`,
+        status: res.status,
+      };
+    } catch {
+      if (
+        text.toLowerCase().includes("request entity too large") ||
+        text.toLowerCase().includes("body exceeded") ||
+        text.toLowerCase().includes("body limit") ||
+        text.toLowerCase().includes("payload too large") ||
+        res.status === 413
+      ) {
+        return {
+          ok: false,
+          error: "요청 데이터가 너무 큽니다 (Vercel 4.5MB 제한 초과)",
+          status: 413,
+        };
+      }
+      return {
+        ok: false,
+        error: text.substring(0, 200) || `서버 오류 (${res.status})`,
+        status: res.status,
+      };
+    }
+  }
+
+  // HTTP 성공이지만 body가 JSON이 아닐 수 있음
+  try {
+    const data = JSON.parse(text) as T;
+    return { ok: true, data };
+  } catch {
+    return {
+      ok: false,
+      error: `서버가 잘못된 응답을 반환했습니다: ${text.substring(0, 100)}`,
+      status: res.status,
+    };
   }
 }
 
