@@ -6,7 +6,7 @@ import { formatDateForTitle } from "@/lib/date-utils";
 import { MeetingSummary } from "@/types";
 import { getSessionUser } from "@/lib/auth-utils";
 
-export const maxDuration = 300; // 긴 녹음 파일의 전사+요약 처리를 위해 5분
+export const maxDuration = 60; // Vercel Hobby 플랜 최대 60초
 
 export async function POST(request: NextRequest) {
   try {
@@ -15,12 +15,31 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "인증이 필요합니다." }, { status: 401 });
     }
 
-    const { audioBase64, audioFormat, projectId } = await request.json();
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return NextResponse.json(
+        { error: "요청 데이터가 너무 크거나 잘못되었습니다. 녹음 시간을 줄여주세요." },
+        { status: 413 }
+      );
+    }
+
+    const { audioBase64, audioFormat, projectId } = body;
 
     if (!audioBase64) {
       return NextResponse.json(
         { error: "오디오 데이터가 없습니다." },
         { status: 400 }
+      );
+    }
+
+    // Base64 크기 체크 (약 20MB 제한 - Gemini API 제한 고려)
+    const base64SizeMB = (audioBase64.length * 3) / 4 / 1024 / 1024;
+    if (base64SizeMB > 20) {
+      return NextResponse.json(
+        { error: `오디오 파일이 너무 큽니다 (${base64SizeMB.toFixed(1)}MB). 녹음 시간을 줄여주세요.` },
+        { status: 413 }
       );
     }
 

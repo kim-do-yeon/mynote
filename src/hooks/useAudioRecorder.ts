@@ -38,16 +38,18 @@ function getFormatFromMime(mime: string): string {
   return "ogg";
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  // 청크 단위로 처리하여 큰 파일에서도 안전하게 변환
-  const chunkSize = 8192;
-  let binary = "";
-  for (let i = 0; i < bytes.byteLength; i += chunkSize) {
-    const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.byteLength));
-    binary += String.fromCharCode(...chunk);
-  }
-  return btoa(binary);
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const dataUrl = reader.result as string;
+      // "data:audio/ogg;base64,XXXX" 에서 base64 부분만 추출
+      const base64 = dataUrl.split(",")[1] || "";
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
 
 export function useAudioRecorder(): UseAudioRecorderReturn {
@@ -90,7 +92,7 @@ export function useAudioRecorder(): UseAudioRecorderReturn {
         }
       };
 
-      mediaRecorder.onstop = () => {
+      mediaRecorder.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: mimeType });
         setAudioSizeKB(Math.round(blob.size / 1024));
         setActualMimeType(mimeType);
@@ -99,15 +101,15 @@ export function useAudioRecorder(): UseAudioRecorderReturn {
         const blobUrl = URL.createObjectURL(blob);
         setAudioBlobUrl(blobUrl);
 
-        // ArrayBuffer를 통한 안전한 base64 변환 (ByteString 오류 방지)
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const buffer = reader.result as ArrayBuffer;
-          const base64 = arrayBufferToBase64(buffer);
+        // 브라우저 네이티브 base64 변환 (대용량 파일 안전)
+        try {
+          const base64 = await blobToBase64(blob);
           setAudioBase64(base64);
           setStatus("stopped");
-        };
-        reader.readAsArrayBuffer(blob);
+        } catch {
+          setError("녹음 데이터 변환에 실패했습니다. 다시 시도해주세요.");
+          setStatus("error");
+        }
 
         // 마이크 해제
         stream.getTracks().forEach((track) => track.stop());
