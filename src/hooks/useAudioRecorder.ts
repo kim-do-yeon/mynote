@@ -13,6 +13,8 @@ interface UseAudioRecorderReturn {
   audioFormat: string;
   actualMimeType: string;
   audioSizeKB: number;
+  /** MediaRecorder의 1초 단위 raw data chunks (분할 처리용) */
+  dataChunks: Blob[];
   error: string | null;
   reset: () => void;
 }
@@ -59,6 +61,7 @@ export function useAudioRecorder(): UseAudioRecorderReturn {
   const [audioFormat, setAudioFormat] = useState("ogg");
   const [actualMimeType, setActualMimeType] = useState("");
   const [audioSizeKB, setAudioSizeKB] = useState(0);
+  const [dataChunks, setDataChunks] = useState<Blob[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -69,6 +72,7 @@ export function useAudioRecorder(): UseAudioRecorderReturn {
     try {
       setError(null);
       setAudioBase64(null);
+      setDataChunks([]);
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -93,7 +97,10 @@ export function useAudioRecorder(): UseAudioRecorderReturn {
       };
 
       mediaRecorder.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: mimeType });
+        const allChunks = [...chunksRef.current];
+        setDataChunks(allChunks);
+
+        const blob = new Blob(allChunks, { type: mimeType });
         setAudioSizeKB(Math.round(blob.size / 1024));
         setActualMimeType(mimeType);
 
@@ -148,6 +155,7 @@ export function useAudioRecorder(): UseAudioRecorderReturn {
     setAudioBlobUrl(null);
     setAudioSizeKB(0);
     setActualMimeType("");
+    setDataChunks([]);
     setError(null);
   }, [audioBlobUrl]);
 
@@ -160,6 +168,7 @@ export function useAudioRecorder(): UseAudioRecorderReturn {
     audioFormat,
     actualMimeType,
     audioSizeKB,
+    dataChunks,
     error,
     reset,
   };

@@ -65,3 +65,30 @@ export interface TranscribeResponse {
 export interface ApiError {
   error: string;
 }
+
+// --- Chunk 기반 전사/요약 타입 ---
+
+export interface TranscribeChunkRequest {
+  audioBase64: string;
+  audioFormat: string;
+  chunkIndex: number;
+  totalChunks: number;
+}
+
+export interface TranscribeChunkResponse {
+  chunkIndex: number;
+  transcript: string;
+}
+
+export interface SummarizeRequest {
+  transcript: string;
+  projectId: string;
+  audioDuration?: number;
+}
+
+export interface SummarizeResponse {
+  meetingId: string;
+  summary: MeetingSummary;
+  title: string;
+  transcript: string;
+}

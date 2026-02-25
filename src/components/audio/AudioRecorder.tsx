@@ -7,6 +7,12 @@ import { useTimer } from "@/hooks/useTimer";
 import RecordingIndicator from "./RecordingIndicator";
 import Button from "@/components/ui/Button";
 import Spinner from "@/components/ui/Spinner";
+import {
+  groupDataChunks,
+  blobToBase64,
+  needsChunking,
+  safeParseErrorResponse,
+} from "@/lib/audio-chunker";
 import { TranscribeResponse } from "@/types";
 
 const MAX_RECORDING_SECONDS = 80 * 60; // 80분
@@ -23,6 +29,19 @@ interface AudioRecorderProps {
   projectId: string;
 }
 
+interface ChunkProgress {
+  totalChunks: number;
+  completedChunks: number;
+  currentStep: "chunking" | "transcribing" | "summarizing";
+}
+
+/** 바이트를 사람이 읽기 편한 단위로 변환 */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
 export default function AudioRecorder({ projectId }: AudioRecorderProps) {
   const router = useRouter();
   const {
@@ -34,6 +53,7 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
     audioFormat,
     actualMimeType,
     audioSizeKB,
+    dataChunks,
     error: recorderError,
     reset: resetRecorder,
   } = useAudioRecorder();
@@ -43,10 +63,21 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
   const [processingMessage, setProcessingMessage] = useState("");
   const [result, setResult] = useState<TranscribeResponse | null>(null);
   const [error, setError] = useState("");
+  const [chunkProgress, setChunkProgress] = useState<ChunkProgress | null>(
+    null
+  );
+  // 처리 로그 (실시간 진행 현황)
+  const [processLogs, setProcessLogs] = useState<string[]>([]);
+
+  const addLog = (msg: string) => {
+    const timestamp = new Date().toLocaleTimeString("ko-KR");
+    setProcessLogs((prev) => [...prev, `[${timestamp}] ${msg}`]);
+  };
 
   const handleStart = async () => {
     setState("recording");
     setError("");
+    setProcessLogs([]);
     timer.start();
     await startRecording();
   };
@@ -56,41 +87,143 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
     timer.stop();
   };
 
+  /** 항상 분할 처리: 데이터 크기에 따라 자동으로 1개 또는 N개 chunk */
   const handleProcess = async () => {
-    if (!audioBase64) {
+    if (dataChunks.length === 0) {
       setError("녹음 데이터가 없습니다. 다시 녹음해주세요.");
       setState("error");
       return;
     }
 
     setState("processing");
-    setProcessingMessage("음성을 텍스트로 변환하고 있습니다...");
     setError("");
+    setProcessLogs([]);
+
+    const totalRawSize = dataChunks.reduce((sum, c) => sum + c.size, 0);
+    addLog(
+      `녹음 데이터: ${dataChunks.length}개 조각, 총 ${formatBytes(totalRawSize)}`
+    );
 
     try {
-      const res = await fetch("/api/transcribe", {
+      // Step 1: 크기 기반으로 오디오 chunk 분할
+      setChunkProgress({
+        totalChunks: 0,
+        completedChunks: 0,
+        currentStep: "chunking",
+      });
+      setProcessingMessage("오디오를 분할하고 있습니다...");
+
+      const audioBlobs = groupDataChunks(dataChunks, actualMimeType);
+      const totalChunks = audioBlobs.length;
+
+      addLog(`${totalChunks}개 구간으로 분할 완료`);
+      for (let i = 0; i < totalChunks; i++) {
+        addLog(
+          `  구간 ${i + 1}: ${formatBytes(audioBlobs[i].size)}`
+        );
+      }
+
+      setChunkProgress({
+        totalChunks,
+        completedChunks: 0,
+        currentStep: "transcribing",
+      });
+
+      // Step 2: 각 chunk를 순차적으로 전사
+      const transcripts: string[] = new Array(totalChunks).fill("");
+
+      for (let i = 0; i < totalChunks; i++) {
+        setProcessingMessage(
+          `음성 변환 중... (${i + 1}/${totalChunks} 구간)`
+        );
+        addLog(`구간 ${i + 1}/${totalChunks} 전사 시작...`);
+
+        const chunkBase64 = await blobToBase64(audioBlobs[i]);
+        addLog(
+          `  base64 변환 완료: ${formatBytes(chunkBase64.length)} (문자열 길이)`
+        );
+
+        const res = await fetch("/api/transcribe-chunk", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            audioBase64: chunkBase64,
+            audioFormat,
+            chunkIndex: i,
+            totalChunks,
+          }),
+        });
+
+        if (!res.ok) {
+          const errorMsg = await safeParseErrorResponse(res);
+          addLog(`  ❌ 실패 (HTTP ${res.status}): ${errorMsg}`);
+          throw new Error(
+            `${i + 1}번째 구간 처리 실패: ${errorMsg}`
+          );
+        }
+
+        const data = await res.json();
+        transcripts[i] = data.transcript || "";
+        addLog(
+          `  ✅ 전사 완료: ${transcripts[i].length}자`
+        );
+
+        setChunkProgress({
+          totalChunks,
+          completedChunks: i + 1,
+          currentStep: "transcribing",
+        });
+      }
+
+      // Step 3: 전사 결과 통합
+      const fullTranscript = transcripts
+        .filter((t) => t.trim().length > 0 && t.trim() !== "[무음]")
+        .join("\n\n");
+
+      addLog(`전체 전사 텍스트: ${fullTranscript.length}자`);
+
+      if (!fullTranscript || fullTranscript.trim().length === 0) {
+        setError("음성을 인식할 수 없습니다. 더 선명하게 녹음해 주세요.");
+        setState("error");
+        return;
+      }
+
+      // Step 4: 통합 요약
+      setChunkProgress({
+        totalChunks,
+        completedChunks: totalChunks,
+        currentStep: "summarizing",
+      });
+      setProcessingMessage("회의록을 요약하고 있습니다...");
+      addLog("요약 생성 시작...");
+
+      const summaryRes = await fetch("/api/summarize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          audioBase64,
-          audioFormat,
+          transcript: fullTranscript,
           projectId,
+          audioDuration: timer.seconds,
         }),
       });
 
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "처리 중 오류가 발생했습니다.");
+      if (!summaryRes.ok) {
+        const errorMsg = await safeParseErrorResponse(summaryRes);
+        addLog(`❌ 요약 실패: ${errorMsg}`);
+        throw new Error(errorMsg);
       }
 
-      const data: TranscribeResponse = await res.json();
-      setResult(data);
+      const summaryData: TranscribeResponse = await summaryRes.json();
+      addLog("✅ 회의록 생성 완료!");
+      setResult(summaryData);
       setState("completed");
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "처리 중 오류가 발생했습니다."
       );
       setState("error");
+    } finally {
+      setChunkProgress(null);
     }
   };
 
@@ -100,6 +233,8 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
     setState("idle");
     setError("");
     setResult(null);
+    setChunkProgress(null);
+    setProcessLogs([]);
   };
 
   // 80분 도달 시 자동 녹음 중지
@@ -128,7 +263,24 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
   const remainingSeconds = MAX_RECORDING_SECONDS - timer.seconds;
   const remainingMin = Math.floor(remainingSeconds / 60);
   const remainingSec = remainingSeconds % 60;
-  const isNearLimit = remainingSeconds <= 5 * 60; // 5분 이하일 때 경고
+  const isNearLimit = remainingSeconds <= 5 * 60;
+
+  // 진행률 퍼센트 계산
+  const progressPercent = chunkProgress
+    ? chunkProgress.currentStep === "summarizing"
+      ? 90
+      : chunkProgress.totalChunks > 0
+        ? Math.round(
+            (chunkProgress.completedChunks / chunkProgress.totalChunks) * 80
+          )
+        : 0
+    : 0;
+
+  // 미리보기용: 예상 chunk 수 계산
+  const previewTotalSize = dataChunks.reduce((sum, c) => sum + c.size, 0);
+  const previewChunkCount = needsChunking(dataChunks)
+    ? groupDataChunks(dataChunks, actualMimeType).length
+    : 1;
 
   return (
     <div className="max-w-lg mx-auto text-center">
@@ -176,7 +328,9 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
             </svg>
             녹음 종료
           </Button>
-          <p className={`text-xs ${isNearLimit ? "text-danger font-medium" : "text-muted"}`}>
+          <p
+            className={`text-xs ${isNearLimit ? "text-danger font-medium" : "text-muted"}`}
+          >
             {isNearLimit
               ? `남은 시간: ${remainingMin}분 ${String(remainingSec).padStart(2, "0")}초`
               : "최대 80분까지 녹음할 수 있습니다."}
@@ -218,27 +372,23 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
             </div>
           )}
 
-          {/* 디버그 정보 */}
+          {/* 녹음 정보 */}
           <div className="bg-gray-50 rounded-lg p-3 text-left text-xs text-muted space-y-1">
             <p>
               <span className="font-medium">녹음 시간:</span> {timer.formatted}
             </p>
             <p>
-              <span className="font-medium">파일 크기:</span> {audioSizeKB} KB
+              <span className="font-medium">파일 크기:</span>{" "}
+              {formatBytes(previewTotalSize)}
             </p>
             <p>
               <span className="font-medium">녹음 포맷:</span> {actualMimeType}
             </p>
             <p>
-              <span className="font-medium">전송 포맷:</span> {audioFormat}
-            </p>
-            <p>
-              <span className="font-medium">Base64 길이:</span>{" "}
-              {audioBase64 ? audioBase64.length.toLocaleString() : "없음"}
-            </p>
-            <p>
-              <span className="font-medium">Base64 시작:</span>{" "}
-              {audioBase64 ? audioBase64.substring(0, 30) + "..." : "없음"}
+              <span className="font-medium">처리 방식:</span>{" "}
+              {previewChunkCount > 1
+                ? `분할 처리 (${previewChunkCount}개 구간)`
+                : "단일 처리 (1개 구간)"}
             </p>
           </div>
 
@@ -261,8 +411,40 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
             <p className="text-lg font-medium mb-2">회의록 생성 중</p>
             <p className="text-sm text-muted">{processingMessage}</p>
           </div>
+
+          {/* 분할 처리 진행률 바 */}
+          {chunkProgress && chunkProgress.totalChunks > 0 && (
+            <div className="space-y-2">
+              <div className="w-full bg-gray-200 rounded-full h-2.5">
+                <div
+                  className="bg-primary h-2.5 rounded-full transition-all duration-500"
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+              <p className="text-xs text-muted">
+                {chunkProgress.currentStep === "transcribing" &&
+                  `음성 변환: ${chunkProgress.completedChunks}/${chunkProgress.totalChunks} 구간 완료`}
+                {chunkProgress.currentStep === "summarizing" &&
+                  "요약을 생성하고 있습니다..."}
+                {chunkProgress.currentStep === "chunking" &&
+                  "오디오를 분할하고 있습니다..."}
+              </p>
+            </div>
+          )}
+
+          {/* 처리 로그 */}
+          {processLogs.length > 0 && (
+            <div className="bg-gray-900 rounded-lg p-3 text-left max-h-48 overflow-y-auto">
+              {processLogs.map((log, i) => (
+                <p key={i} className="text-xs text-green-400 font-mono leading-relaxed">
+                  {log}
+                </p>
+              ))}
+            </div>
+          )}
+
           <p className="text-xs text-muted">
-            녹음 시간에 따라 1~5분 정도 소요될 수 있습니다.
+            녹음 길이에 따라 시간이 소요됩니다.
           </p>
         </div>
       )}
@@ -294,6 +476,22 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
             <h3 className="font-bold text-sm mb-2">요약</h3>
             <p className="text-sm text-muted">{result.summary.overview}</p>
           </div>
+
+          {/* 처리 로그 (접을 수 있게) */}
+          {processLogs.length > 0 && (
+            <details className="text-left">
+              <summary className="text-xs text-muted cursor-pointer">
+                처리 로그 보기
+              </summary>
+              <div className="bg-gray-900 rounded-lg p-3 mt-2 max-h-48 overflow-y-auto">
+                {processLogs.map((log, i) => (
+                  <p key={i} className="text-xs text-green-400 font-mono leading-relaxed">
+                    {log}
+                  </p>
+                ))}
+              </div>
+            </details>
+          )}
 
           <div className="flex gap-3 justify-center">
             <Button
@@ -334,6 +532,18 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
             <p className="text-lg font-medium mb-2">오류가 발생했습니다</p>
             <p className="text-sm text-danger">{error}</p>
           </div>
+
+          {/* 에러 시에도 처리 로그 표시 */}
+          {processLogs.length > 0 && (
+            <div className="bg-gray-900 rounded-lg p-3 text-left max-h-48 overflow-y-auto">
+              {processLogs.map((log, i) => (
+                <p key={i} className="text-xs text-green-400 font-mono leading-relaxed">
+                  {log}
+                </p>
+              ))}
+            </div>
+          )}
+
           <Button onClick={handleRetry}>다시 시도</Button>
         </div>
       )}
