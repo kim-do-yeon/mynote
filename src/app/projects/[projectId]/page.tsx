@@ -6,6 +6,7 @@ import BackButton from "@/components/layout/BackButton";
 import Button from "@/components/ui/Button";
 import ProjectDeleteButton from "@/components/projects/ProjectDeleteButton";
 import MeetingCard from "@/components/meetings/MeetingCard";
+import SearchPanel from "@/components/search/SearchPanel";
 import { connectToDatabase } from "@/lib/mongodb";
 import { getSessionUser } from "@/lib/auth-utils";
 
@@ -126,6 +127,13 @@ export default async function ProjectDetailPage({
             ))}
           </div>
         )}
+
+        <SearchPanel
+          projectId={projectId}
+          completedMeetingCount={
+            meetings.filter((m) => m.status === "completed").length
+          }
+        />
       </main>
     </>
   );

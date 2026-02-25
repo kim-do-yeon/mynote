@@ -66,6 +66,21 @@ export interface ApiError {
   error: string;
 }
 
+// --- 검색 관련 타입 ---
+
+export interface SearchSource {
+  meetingId: string;
+  meetingTitle: string;
+  createdAt: string;
+  relevance: string;
+}
+
+export interface SearchResponse {
+  answer: string;
+  sources: SearchSource[];
+  meetingsAnalyzed: number;
+}
+
 // --- Chunk 기반 전사/요약 타입 ---
 
 export interface TranscribeChunkRequest {

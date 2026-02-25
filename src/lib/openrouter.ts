@@ -1,4 +1,5 @@
-import { MeetingSummary } from "@/types";
+import { MeetingSummary, SearchSource } from "@/types";
+import { ObjectId } from "mongodb";
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY!;
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
@@ -213,6 +214,130 @@ ${transcript}`,
       decisions: [],
       actionItems: [],
       participants: [],
+    };
+  }
+}
+
+// --- 회의록 검색 ---
+
+const SEARCH_SYSTEM_PROMPT = `당신은 회의록 검색 도우미입니다. 사용자가 질문하면 제공된 회의록 데이터에서만 답변합니다.
+
+절대적인 규칙:
+1. 제공된 회의록 데이터에 실제로 존재하는 내용만 답변에 포함합니다.
+2. 회의록에 없는 내용을 추측하거나 지어내지 마세요.
+3. 답변할 수 없는 질문이면 "제공된 회의록에서 관련 내용을 찾을 수 없습니다."라고 답하세요.
+4. 각 정보의 출처가 되는 회의록 ID를 반드시 명시하세요.
+5. 모든 답변은 한국어로 작성합니다.
+6. 여러 회의록에서 정보를 종합할 때, 각 정보가 어느 회의에서 나온 것인지 구분하세요.
+
+반드시 아래 JSON 형식으로만 응답하세요. JSON 외 다른 텍스트를 포함하지 마세요:
+{
+  "answer": "질문에 대한 상세한 답변 (한국어)",
+  "sources": [
+    {
+      "meetingId": "회의록의 ID",
+      "meetingTitle": "회의록 제목",
+      "createdAt": "회의 날짜",
+      "relevance": "이 회의록이 답변과 관련된 이유를 간단히 설명"
+    }
+  ]
+}`;
+
+interface MeetingForSearch {
+  _id: ObjectId;
+  title: string;
+  summary: MeetingSummary;
+  transcript: string;
+  createdAt: Date;
+}
+
+const MAX_CONTEXT_CHARS = 100_000;
+
+export async function searchMeetings(
+  query: string,
+  meetings: MeetingForSearch[]
+): Promise<{ answer: string; sources: SearchSource[] }> {
+  // 각 회의록의 요약을 구조화된 컨텍스트로 변환
+  const meetingContexts = meetings.map((m, index) => {
+    const summary = m.summary;
+    return `--- 회의록 #${index + 1} ---
+ID: ${m._id.toString()}
+제목: ${m.title}
+날짜: ${m.createdAt instanceof Date ? m.createdAt.toISOString().split("T")[0] : String(m.createdAt).split("T")[0]}
+개요: ${summary.overview || "없음"}
+주요 논의: ${summary.keyPoints?.join("; ") || "없음"}
+결정 사항: ${summary.decisions?.join("; ") || "없음"}
+실행 항목: ${summary.actionItems?.map((a) => `${a.task}(${a.assignee}, ${a.deadline})`).join("; ") || "없음"}
+참석자: ${summary.participants?.join(", ") || "없음"}`;
+  });
+
+  // 컨텍스트 크기 안전장치: 너무 크면 최신 회의록 우선 truncate
+  let contextBlock = "";
+  for (const ctx of meetingContexts) {
+    if ((contextBlock + ctx).length > MAX_CONTEXT_CHARS) break;
+    contextBlock += ctx + "\n\n";
+  }
+
+  const userMessage = `다음은 프로젝트의 모든 회의록 데이터입니다:
+
+${contextBlock}
+---
+사용자 질문: ${query}
+
+위 회의록 데이터에서만 답변하세요. 데이터에 없는 내용은 절대 포함하지 마세요.`;
+
+  const requestBody = JSON.stringify({
+    model: SUMMARY_MODEL,
+    messages: [
+      { role: "system", content: SEARCH_SYSTEM_PROMPT },
+      { role: "user", content: userMessage },
+    ],
+  });
+  const bodyBuffer = Buffer.from(requestBody, "utf-8");
+
+  const response = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Length": String(bodyBuffer.byteLength),
+      "HTTP-Referer":
+        process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
+      "X-Title": "MyNote",
+    },
+    body: bodyBuffer,
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(
+      `검색 실패: ${errorData.error?.message || response.statusText}`
+    );
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content || "{}";
+
+  // JSON 추출 (summarizeTranscript와 동일한 패턴)
+  let jsonString = content.trim();
+  const jsonBlockMatch = jsonString.match(
+    /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/
+  );
+  if (jsonBlockMatch) {
+    jsonString = jsonBlockMatch[1].trim();
+  }
+
+  try {
+    const parsed = JSON.parse(jsonString);
+    return {
+      answer: parsed.answer || "답변을 생성할 수 없습니다.",
+      sources: Array.isArray(parsed.sources) ? parsed.sources : [],
+    };
+  } catch {
+    console.error("검색 JSON 파싱 실패:", content.substring(0, 500));
+    return {
+      answer: content.substring(0, 1000),
+      sources: [],
     };
   }
 }
