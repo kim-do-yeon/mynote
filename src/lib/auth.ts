@@ -40,7 +40,6 @@ async function getUserIdFromDb(email: string): Promise<string | null> {
 }
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
-  debug: true,
   trustHost: true,
   providers: [
     Google({
