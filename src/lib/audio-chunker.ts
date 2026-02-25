@@ -2,33 +2,20 @@
  * 클라이언트 사이드 오디오 분할 유틸리티
  *
  * 핵심 전략:
- * MediaRecorder의 1초 단위 data chunk를 점진적으로 합치면서
- * base64 크기가 Vercel body limit(4.5MB)을 넘기 전에 끊어서 분할합니다.
+ * 1. MediaRecorder의 1초 단위 data chunk를 크기 기반으로 그룹화
+ * 2. 각 그룹을 FormData(multipart)로 전송 → base64 오버헤드 제거
+ * 3. Vercel body limit(4.5MB) 안에서 최대한 큰 chunk 전송
  *
- * 시간 기반이 아닌 **크기 기반 분할**로 안정적으로 동작합니다.
+ * FormData는 binary를 그대로 전송하므로 base64(+33%) 대비 효율적.
+ * 안전 마진을 두고 chunk당 Blob 크기를 3.5MB 이하로 제한.
  */
 
 /**
- * Vercel Serverless Function의 request body 제한은 4.5MB.
- * JSON 구조의 오버헤드를 고려하여 base64 데이터는 3MB 이하로 유지.
- * base64 인코딩은 원본 대비 약 1.37배이므로,
- * 원본 Blob 크기 기준으로 약 2.2MB 이하로 자릅니다.
+ * Vercel Serverless Function의 request body 제한: 4.5MB
+ * FormData 멀티파트 오버헤드(boundary, headers 등) 약 수백 바이트 고려
+ * → Blob 자체는 3.5MB 이하로 제한하면 충분히 안전
  */
-const MAX_CHUNK_BLOB_BYTES = 2.2 * 1024 * 1024; // ~2.2MB Blob → ~3MB base64
-
-/** Blob → base64 문자열 변환 (FileReader 사용, 대용량 안전) */
-export function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const dataUrl = reader.result as string;
-      const base64 = dataUrl.split(",")[1] || "";
-      resolve(base64);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-}
+const MAX_CHUNK_BLOB_BYTES = 3.5 * 1024 * 1024; // 3.5MB
 
 /**
  * 1초 단위 data chunk 배열을 크기 기반으로 Blob 배열로 묶기.
@@ -43,9 +30,10 @@ export function groupDataChunks(
   let currentSize = 0;
 
   for (const chunk of dataChunks) {
-    // 현재 그룹에 이 chunk를 추가하면 초과하는지 확인
-    if (currentSize + chunk.size > MAX_CHUNK_BLOB_BYTES && currentGroup.length > 0) {
-      // 현재 그룹을 확정하고 새 그룹 시작
+    if (
+      currentSize + chunk.size > MAX_CHUNK_BLOB_BYTES &&
+      currentGroup.length > 0
+    ) {
       groups.push(new Blob(currentGroup, { type: mimeType }));
       currentGroup = [];
       currentSize = 0;
@@ -54,7 +42,6 @@ export function groupDataChunks(
     currentSize += chunk.size;
   }
 
-  // 마지막 그룹
   if (currentGroup.length > 0) {
     groups.push(new Blob(currentGroup, { type: mimeType }));
   }
@@ -63,17 +50,9 @@ export function groupDataChunks(
 }
 
 /**
- * 녹음 데이터를 분할이 필요한지 판단.
- * 전체 오디오 Blob 크기가 MAX_CHUNK_BLOB_BYTES를 초과하면 분할.
- */
-export function needsChunking(dataChunks: Blob[]): boolean {
-  const totalSize = dataChunks.reduce((sum, chunk) => sum + chunk.size, 0);
-  return totalSize > MAX_CHUNK_BLOB_BYTES;
-}
-
-/**
  * fetch 응답에서 에러 메시지를 안전하게 추출.
- * JSON 파싱 실패 시 텍스트로 폴백.
+ * Vercel이 JSON이 아닌 텍스트("Request Entity Too Large")를 반환할 수 있으므로
+ * 반드시 text()로 먼저 읽고 JSON 파싱을 시도합니다.
  */
 export async function safeParseErrorResponse(res: Response): Promise<string> {
   try {
@@ -82,7 +61,6 @@ export async function safeParseErrorResponse(res: Response): Promise<string> {
       const json = JSON.parse(text);
       return json.error || json.message || `서버 오류 (${res.status})`;
     } catch {
-      // JSON이 아닌 경우 (예: "Request Entity Too Large")
       if (
         text.toLowerCase().includes("request entity too large") ||
         text.toLowerCase().includes("body exceeded") ||
@@ -90,13 +68,20 @@ export async function safeParseErrorResponse(res: Response): Promise<string> {
         text.toLowerCase().includes("payload too large") ||
         res.status === 413
       ) {
-        return "요청 데이터가 너무 큽니다. 녹음 시간을 줄여주세요.";
+        return "요청 데이터가 너무 큽니다 (Vercel 4.5MB 제한 초과). 자동으로 더 작게 분할해야 합니다.";
       }
       return text.substring(0, 200) || `서버 오류 (${res.status})`;
     }
   } catch {
     return `서버 오류 (${res.status})`;
   }
+}
+
+/** 바이트를 사람이 읽기 편한 단위로 변환 */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
 }
 
 export { MAX_CHUNK_BLOB_BYTES };

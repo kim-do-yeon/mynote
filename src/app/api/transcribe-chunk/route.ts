@@ -8,45 +8,54 @@ export async function POST(request: NextRequest) {
   try {
     const user = await getSessionUser();
     if (!user) {
-      return NextResponse.json({ error: "인증이 필요합니다." }, { status: 401 });
-    }
-
-    let body;
-    try {
-      body = await request.json();
-    } catch {
       return NextResponse.json(
-        { error: "요청 데이터가 너무 크거나 잘못되었습니다." },
-        { status: 413 }
+        { error: "인증이 필요합니다." },
+        { status: 401 }
       );
     }
 
-    const { audioBase64, audioFormat, chunkIndex, totalChunks } = body;
+    // FormData로 수신 (multipart/form-data)
+    let formData: FormData;
+    try {
+      formData = await request.formData();
+    } catch {
+      return NextResponse.json(
+        { error: "요청 데이터를 파싱할 수 없습니다." },
+        { status: 400 }
+      );
+    }
 
-    if (!audioBase64) {
+    const audioFile = formData.get("audio") as File | null;
+    const audioFormat = (formData.get("audioFormat") as string) || "webm";
+    const chunkIndex = parseInt(
+      (formData.get("chunkIndex") as string) || "0",
+      10
+    );
+    const totalChunks = parseInt(
+      (formData.get("totalChunks") as string) || "1",
+      10
+    );
+
+    if (!audioFile || audioFile.size === 0) {
       return NextResponse.json(
         { error: "오디오 데이터가 없습니다." },
         { status: 400 }
       );
     }
 
-    // Base64 크기 체크 (개별 chunk는 최대 20MB)
-    const base64SizeMB = (audioBase64.length * 3) / 4 / 1024 / 1024;
-    if (base64SizeMB > 20) {
-      return NextResponse.json(
-        { error: `오디오 chunk가 너무 큽니다 (${base64SizeMB.toFixed(1)}MB).` },
-        { status: 413 }
-      );
-    }
-
+    const fileSizeMB = audioFile.size / 1024 / 1024;
     console.log(
-      `[chunk ${chunkIndex + 1}/${totalChunks}] 전사 시작 (${base64SizeMB.toFixed(1)}MB)`
+      `[chunk ${chunkIndex + 1}/${totalChunks}] 전사 시작 (${fileSizeMB.toFixed(2)}MB, ${audioFormat})`
     );
+
+    // File → ArrayBuffer → Base64 변환 (서버에서 수행)
+    const arrayBuffer = await audioFile.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString("base64");
 
     // 음성 → 텍스트 전사
     let transcript: string;
     try {
-      transcript = await transcribeAudio(audioBase64, audioFormat || "webm");
+      transcript = await transcribeAudio(base64, audioFormat);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error(`[chunk ${chunkIndex + 1}] 전사 실패:`, errorMsg);

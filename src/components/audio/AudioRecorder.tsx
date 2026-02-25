@@ -9,9 +9,8 @@ import Button from "@/components/ui/Button";
 import Spinner from "@/components/ui/Spinner";
 import {
   groupDataChunks,
-  blobToBase64,
-  needsChunking,
   safeParseErrorResponse,
+  formatBytes,
 } from "@/lib/audio-chunker";
 import { TranscribeResponse } from "@/types";
 
@@ -35,11 +34,12 @@ interface ChunkProgress {
   currentStep: "chunking" | "transcribing" | "summarizing";
 }
 
-/** 바이트를 사람이 읽기 편한 단위로 변환 */
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+/** Blob의 MIME type에서 파일 확장자 추출 */
+function getExtFromMime(mime: string): string {
+  if (mime.includes("ogg")) return "ogg";
+  if (mime.includes("mp4")) return "m4a";
+  if (mime.includes("webm")) return "webm";
+  return "webm";
 }
 
 export default function AudioRecorder({ projectId }: AudioRecorderProps) {
@@ -66,13 +66,18 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
   const [chunkProgress, setChunkProgress] = useState<ChunkProgress | null>(
     null
   );
-  // 처리 로그 (실시간 진행 현황)
   const [processLogs, setProcessLogs] = useState<string[]>([]);
+  const logsEndRef = useRef<HTMLDivElement>(null);
 
   const addLog = (msg: string) => {
     const timestamp = new Date().toLocaleTimeString("ko-KR");
     setProcessLogs((prev) => [...prev, `[${timestamp}] ${msg}`]);
   };
+
+  // 로그 자동 스크롤
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [processLogs]);
 
   const handleStart = async () => {
     setState("recording");
@@ -87,7 +92,12 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
     timer.stop();
   };
 
-  /** 항상 분할 처리: 데이터 크기에 따라 자동으로 1개 또는 N개 chunk */
+  /**
+   * 핵심 처리 로직:
+   * 1. dataChunks를 크기 기반으로 분할
+   * 2. 각 chunk를 FormData(multipart)로 서버에 전송 → base64 오버헤드 없음
+   * 3. 모든 전사 결과를 합친 후 요약 API 호출
+   */
   const handleProcess = async () => {
     if (dataChunks.length === 0) {
       setError("녹음 데이터가 없습니다. 다시 녹음해주세요.");
@@ -115,12 +125,11 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
 
       const audioBlobs = groupDataChunks(dataChunks, actualMimeType);
       const totalChunks = audioBlobs.length;
+      const ext = getExtFromMime(actualMimeType);
 
       addLog(`${totalChunks}개 구간으로 분할 완료`);
       for (let i = 0; i < totalChunks; i++) {
-        addLog(
-          `  구간 ${i + 1}: ${formatBytes(audioBlobs[i].size)}`
-        );
+        addLog(`  구간 ${i + 1}: ${formatBytes(audioBlobs[i].size)}`);
       }
 
       setChunkProgress({
@@ -129,7 +138,7 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
         currentStep: "transcribing",
       });
 
-      // Step 2: 각 chunk를 순차적으로 전사
+      // Step 2: 각 chunk를 FormData로 순차 전송
       const transcripts: string[] = new Array(totalChunks).fill("");
 
       for (let i = 0; i < totalChunks; i++) {
@@ -138,35 +147,36 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
         );
         addLog(`구간 ${i + 1}/${totalChunks} 전사 시작...`);
 
-        const chunkBase64 = await blobToBase64(audioBlobs[i]);
-        addLog(
-          `  base64 변환 완료: ${formatBytes(chunkBase64.length)} (문자열 길이)`
+        // Blob → File → FormData (base64 인코딩 없이 binary 직접 전송)
+        const file = new File(
+          [audioBlobs[i]],
+          `chunk-${i}.${ext}`,
+          { type: actualMimeType }
         );
+
+        const formData = new FormData();
+        formData.append("audio", file);
+        formData.append("audioFormat", audioFormat);
+        formData.append("chunkIndex", String(i));
+        formData.append("totalChunks", String(totalChunks));
+
+        addLog(`  FormData 전송: ${formatBytes(file.size)} (binary)`);
 
         const res = await fetch("/api/transcribe-chunk", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            audioBase64: chunkBase64,
-            audioFormat,
-            chunkIndex: i,
-            totalChunks,
-          }),
+          body: formData,
+          // Content-Type 헤더를 설정하지 않음 → 브라우저가 multipart boundary 자동 설정
         });
 
         if (!res.ok) {
           const errorMsg = await safeParseErrorResponse(res);
           addLog(`  ❌ 실패 (HTTP ${res.status}): ${errorMsg}`);
-          throw new Error(
-            `${i + 1}번째 구간 처리 실패: ${errorMsg}`
-          );
+          throw new Error(`${i + 1}번째 구간 처리 실패: ${errorMsg}`);
         }
 
         const data = await res.json();
         transcripts[i] = data.transcript || "";
-        addLog(
-          `  ✅ 전사 완료: ${transcripts[i].length}자`
-        );
+        addLog(`  ✅ 전사 완료: ${transcripts[i].length}자`);
 
         setChunkProgress({
           totalChunks,
@@ -278,9 +288,10 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
 
   // 미리보기용: 예상 chunk 수 계산
   const previewTotalSize = dataChunks.reduce((sum, c) => sum + c.size, 0);
-  const previewChunkCount = needsChunking(dataChunks)
-    ? groupDataChunks(dataChunks, actualMimeType).length
-    : 1;
+  const previewChunkCount =
+    dataChunks.length > 0
+      ? groupDataChunks(dataChunks, actualMimeType).length
+      : 1;
 
   return (
     <div className="max-w-lg mx-auto text-center">
@@ -385,10 +396,8 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
               <span className="font-medium">녹음 포맷:</span> {actualMimeType}
             </p>
             <p>
-              <span className="font-medium">처리 방식:</span>{" "}
-              {previewChunkCount > 1
-                ? `분할 처리 (${previewChunkCount}개 구간)`
-                : "단일 처리 (1개 구간)"}
+              <span className="font-medium">처리 구간:</span>{" "}
+              {previewChunkCount}개 (FormData binary 전송)
             </p>
           </div>
 
@@ -436,10 +445,14 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
           {processLogs.length > 0 && (
             <div className="bg-gray-900 rounded-lg p-3 text-left max-h-48 overflow-y-auto">
               {processLogs.map((log, i) => (
-                <p key={i} className="text-xs text-green-400 font-mono leading-relaxed">
+                <p
+                  key={i}
+                  className="text-xs text-green-400 font-mono leading-relaxed"
+                >
                   {log}
                 </p>
               ))}
+              <div ref={logsEndRef} />
             </div>
           )}
 
@@ -477,7 +490,6 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
             <p className="text-sm text-muted">{result.summary.overview}</p>
           </div>
 
-          {/* 처리 로그 (접을 수 있게) */}
           {processLogs.length > 0 && (
             <details className="text-left">
               <summary className="text-xs text-muted cursor-pointer">
@@ -485,7 +497,10 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
               </summary>
               <div className="bg-gray-900 rounded-lg p-3 mt-2 max-h-48 overflow-y-auto">
                 {processLogs.map((log, i) => (
-                  <p key={i} className="text-xs text-green-400 font-mono leading-relaxed">
+                  <p
+                    key={i}
+                    className="text-xs text-green-400 font-mono leading-relaxed"
+                  >
                     {log}
                   </p>
                 ))}
@@ -533,11 +548,13 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
             <p className="text-sm text-danger">{error}</p>
           </div>
 
-          {/* 에러 시에도 처리 로그 표시 */}
           {processLogs.length > 0 && (
             <div className="bg-gray-900 rounded-lg p-3 text-left max-h-48 overflow-y-auto">
               {processLogs.map((log, i) => (
-                <p key={i} className="text-xs text-green-400 font-mono leading-relaxed">
+                <p
+                  key={i}
+                  className="text-xs text-green-400 font-mono leading-relaxed"
+                >
                   {log}
                 </p>
               ))}
