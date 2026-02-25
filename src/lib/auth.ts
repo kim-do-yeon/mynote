@@ -18,7 +18,6 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     async signIn({ user, account }) {
       if (account?.provider === "google") {
         try {
-          // Edge Runtime 호환을 위해 동적 import
           const { connectToDatabase } = await import("@/lib/mongodb");
           const { db } = await connectToDatabase();
           await db.collection("users").updateOne(
@@ -38,14 +37,13 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
             { upsert: true }
           );
         } catch (error) {
-          console.error("사용자 저장 실패:", error);
-          return false;
+          console.error("사용자 저장 실패 (로그인은 계속 진행):", error);
+          // DB 실패해도 로그인은 허용
         }
       }
       return true;
     },
     async jwt({ token, account }) {
-      // 최초 로그인 시 MongoDB에서 userId를 가져와 토큰에 저장
       if (account) {
         try {
           const { connectToDatabase } = await import("@/lib/mongodb");
@@ -60,10 +58,13 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
           console.error("JWT 사용자 조회 실패:", error);
         }
       }
+      // DB에서 userId를 못 가져왔으면 이메일 해시를 대체 ID로 사용
+      if (!token.userId && token.email) {
+        token.userId = `email:${token.email}`;
+      }
       return token;
     },
     async session({ session, token }) {
-      // JWT 토큰에 저장된 userId를 세션에 주입
       if (token.userId) {
         session.user.id = token.userId as string;
       }
