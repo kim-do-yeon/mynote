@@ -20,21 +20,45 @@ const MAX_CHUNK_BLOB_BYTES = 1 * 1024 * 1024; // 1MB — 안전하게 Vercel 4.5
 /**
  * 1초 단위 data chunk 배열을 크기 기반으로 Blob 배열로 묶기.
  * 각 그룹의 총 byte가 MAX_CHUNK_BLOB_BYTES를 넘지 않도록 합니다.
+ *
+ * ★ 핵심: WebM/OGG 등의 컨테이너 포맷에서 MediaRecorder가 생성하는
+ * 첫 번째 data chunk에만 코덱 초기화 헤더(metadata)가 들어 있습니다.
+ * 두 번째 이후 chunk는 순수 데이터 프레임만 포함하므로,
+ * 헤더 없이는 디코딩이 불가능합니다.
+ *
+ * 따라서 첫 번째 chunk(헤더)를 모든 그룹의 앞에 붙여서
+ * 각 그룹이 독립적으로 디코딩 가능한 오디오 파일이 되도록 합니다.
  */
 export function groupDataChunks(
   dataChunks: Blob[],
   mimeType: string
 ): Blob[] {
+  if (dataChunks.length === 0) return [];
+
+  // 첫 번째 chunk = 코덱 초기화 헤더 포함
+  const headerChunk = dataChunks[0];
+  const dataOnly = dataChunks.slice(1);
+
+  // 데이터 chunk가 없으면 (녹음이 1초 이하) 전체를 하나로
+  if (dataOnly.length === 0) {
+    return [new Blob([headerChunk], { type: mimeType })];
+  }
+
+  // 헤더 크기를 고려한 실제 데이터 용량
+  const headerSize = headerChunk.size;
+  const maxDataPerGroup = MAX_CHUNK_BLOB_BYTES - headerSize;
+
   const groups: Blob[] = [];
   let currentGroup: Blob[] = [];
   let currentSize = 0;
 
-  for (const chunk of dataChunks) {
+  for (const chunk of dataOnly) {
     if (
-      currentSize + chunk.size > MAX_CHUNK_BLOB_BYTES &&
+      currentSize + chunk.size > maxDataPerGroup &&
       currentGroup.length > 0
     ) {
-      groups.push(new Blob(currentGroup, { type: mimeType }));
+      // 헤더 + 현재 그룹 데이터를 합쳐서 하나의 Blob 생성
+      groups.push(new Blob([headerChunk, ...currentGroup], { type: mimeType }));
       currentGroup = [];
       currentSize = 0;
     }
@@ -42,8 +66,9 @@ export function groupDataChunks(
     currentSize += chunk.size;
   }
 
+  // 마지막 그룹
   if (currentGroup.length > 0) {
-    groups.push(new Blob(currentGroup, { type: mimeType }));
+    groups.push(new Blob([headerChunk, ...currentGroup], { type: mimeType }));
   }
 
   return groups;
