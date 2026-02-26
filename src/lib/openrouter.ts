@@ -5,8 +5,8 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY!;
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 // --- 모델 설정 ---
-// 전사(STT): Gemini Flash — 빠르고 저렴, 음성 인식 성능 충분
-const TRANSCRIBE_MODEL = "google/gemini-2.5-flash";
+// 전사(STT): Gemini 2.5 Pro — 최상위 추론 능력, 한국어 전사 품질 우수 ($1.25/M audio tokens)
+const TRANSCRIBE_MODEL = "google/gemini-2.5-pro";
 // 요약: Claude Sonnet 4 — 한국어 요약 품질 우수, 구조화 능력 탁월
 const SUMMARY_MODEL = "anthropic/claude-sonnet-4";
 
