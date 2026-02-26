@@ -15,6 +15,13 @@ import {
 import { TranscribeResponse } from "@/types";
 
 const MAX_RECORDING_SECONDS = 80 * 60; // 80분
+const MAX_RETRIES = 3; // 청크/요약 실패 시 최대 재시도 횟수
+const RETRY_BASE_DELAY_MS = 2000; // 재시도 기본 대기시간 (지수 백오프)
+
+/** 지수 백오프 대기 */
+function waitMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 type ProcessingState =
   | "idle"
@@ -145,29 +152,53 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
           { type: actualMimeType }
         );
 
-        const formData = new FormData();
-        formData.append("audio", file);
-        formData.append("audioFormat", audioFormat);
-        formData.append("chunkIndex", String(i));
-        formData.append("totalChunks", String(totalChunks));
+        // ★ 재시도 로직 (최대 MAX_RETRIES회, 지수 백오프)
+        let chunkSuccess = false;
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+          try {
+            const formData = new FormData();
+            formData.append("audio", file);
+            formData.append("audioFormat", audioFormat);
+            formData.append("chunkIndex", String(i));
+            formData.append("totalChunks", String(totalChunks));
 
-        addLog(`  FormData 전송: ${formatBytes(file.size)} (binary)`);
+            if (attempt === 1) {
+              addLog(`  FormData 전송: ${formatBytes(file.size)} (binary)`);
+            } else {
+              addLog(`  🔄 재시도 ${attempt}/${MAX_RETRIES}...`);
+            }
 
-        const res = await fetch("/api/transcribe-chunk", {
-          method: "POST",
-          body: formData,
-        });
+            const res = await fetch("/api/transcribe-chunk", {
+              method: "POST",
+              body: formData,
+            });
 
-        // ★ 안전 파싱: .json() 직접 호출 안 함
-        const parsed = await safeParseJson<{ chunkIndex: number; transcript: string }>(res);
+            const parsed = await safeParseJson<{ chunkIndex: number; transcript: string }>(res);
 
-        if (!parsed.ok) {
-          addLog(`  ❌ 실패: ${parsed.error}`);
-          throw new Error(`${i + 1}번째 구간 처리 실패: ${parsed.error}`);
+            if (!parsed.ok) {
+              throw new Error(parsed.error);
+            }
+
+            transcripts[i] = parsed.data.transcript || "";
+            addLog(`  ✅ 전사 완료: ${transcripts[i].length}자`);
+            chunkSuccess = true;
+            break; // 성공 시 재시도 루프 탈출
+          } catch (chunkErr) {
+            const errMsg = chunkErr instanceof Error ? chunkErr.message : "알 수 없는 오류";
+            if (attempt < MAX_RETRIES) {
+              const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+              addLog(`  ⚠️ 실패 (${errMsg}), ${(delayMs / 1000).toFixed(0)}초 후 재시도...`);
+              await waitMs(delayMs);
+            } else {
+              addLog(`  ❌ ${MAX_RETRIES}회 시도 모두 실패: ${errMsg}`);
+              throw new Error(`${i + 1}번째 구간 처리 실패 (${MAX_RETRIES}회 재시도 후): ${errMsg}`);
+            }
+          }
         }
 
-        transcripts[i] = parsed.data.transcript || "";
-        addLog(`  ✅ 전사 완료: ${transcripts[i].length}자`);
+        if (!chunkSuccess) {
+          throw new Error(`${i + 1}번째 구간 처리에 실패했습니다.`);
+        }
 
         setChunkProgress({
           totalChunks,
@@ -198,22 +229,47 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
       setProcessingMessage("회의록을 요약하고 있습니다...");
       addLog("요약 생성 시작...");
 
-      const summaryRes = await fetch("/api/summarize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          transcript: fullTranscript,
-          projectId,
-          audioDuration: timer.seconds,
-        }),
-      });
+      // ★ 요약 API도 재시도 로직 적용
+      let summaryParsed: { ok: true; data: TranscribeResponse } | null = null;
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          if (attempt > 1) {
+            addLog(`🔄 요약 재시도 ${attempt}/${MAX_RETRIES}...`);
+          }
 
-      // ★ 안전 파싱
-      const summaryParsed = await safeParseJson<TranscribeResponse>(summaryRes);
+          const summaryRes = await fetch("/api/summarize", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              transcript: fullTranscript,
+              projectId,
+              audioDuration: timer.seconds,
+            }),
+          });
 
-      if (!summaryParsed.ok) {
-        addLog(`❌ 요약 실패: ${summaryParsed.error}`);
-        throw new Error(summaryParsed.error);
+          const parsed = await safeParseJson<TranscribeResponse>(summaryRes);
+
+          if (!parsed.ok) {
+            throw new Error(parsed.error);
+          }
+
+          summaryParsed = parsed;
+          break;
+        } catch (sumErr) {
+          const errMsg = sumErr instanceof Error ? sumErr.message : "알 수 없는 오류";
+          if (attempt < MAX_RETRIES) {
+            const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+            addLog(`⚠️ 요약 실패 (${errMsg}), ${(delayMs / 1000).toFixed(0)}초 후 재시도...`);
+            await waitMs(delayMs);
+          } else {
+            addLog(`❌ 요약 ${MAX_RETRIES}회 시도 모두 실패: ${errMsg}`);
+            throw new Error(`요약 처리 실패 (${MAX_RETRIES}회 재시도 후): ${errMsg}`);
+          }
+        }
+      }
+
+      if (!summaryParsed) {
+        throw new Error("요약 처리에 실패했습니다.");
       }
 
       addLog("✅ 회의록 생성 완료!");
