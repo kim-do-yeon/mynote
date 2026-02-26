@@ -19,15 +19,13 @@ const SUMMARY_SYSTEM_PROMPT = `당신은 전문 회의록 작성자입니다. �
 4. 화자가 구분되어 있다면 발언자 정보를 활용합니다.
 5. 불명확한 내용은 추측하지 않고 "[불명확]"으로 표시합니다.
 6. 실행 항목(Action Items)에는 녹취록에서 실제로 언급된 담당자와 기한만 포함합니다. 언급되지 않았다면 "미정"으로 표시합니다.
-7. 참석자 목록은 녹취록에서 이름이 직접 언급되거나 화자로 구분된 사람만 포함합니다.
 
 반드시 아래 JSON 형식으로만 응답하세요. JSON 외 다른 텍스트를 포함하지 마세요:
 {
   "overview": "회의 전체 내용을 2-3문장으로 요약",
   "keyPoints": ["주요 논의 사항 1", "주요 논의 사항 2"],
   "decisions": ["결정 사항 1", "결정 사항 2"],
-  "actionItems": [{"task": "할 일", "assignee": "담당자 또는 미정", "deadline": "기한 또는 미정"}],
-  "participants": ["참석자1", "참석자2"]
+  "actionItems": [{"task": "할 일", "assignee": "담당자 또는 미정", "deadline": "기한 또는 미정"}]
 }`;
 
 const MEETING_SUMMARY_SCHEMA = {
@@ -60,13 +58,8 @@ const MEETING_SUMMARY_SCHEMA = {
       },
       description: "실행 항목 목록",
     },
-    participants: {
-      type: "array" as const,
-      items: { type: "string" as const },
-      description: "참석자 목록",
-    },
   },
-  required: ["overview", "keyPoints", "decisions", "actionItems", "participants"],
+  required: ["overview", "keyPoints", "decisions", "actionItems"],
 };
 
 export async function transcribeAudio(
@@ -203,7 +196,6 @@ ${transcript}`,
       keyPoints: Array.isArray(parsed.keyPoints) ? parsed.keyPoints : [],
       decisions: Array.isArray(parsed.decisions) ? parsed.decisions : [],
       actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems : [],
-      participants: Array.isArray(parsed.participants) ? parsed.participants : [],
     };
   } catch {
     console.error("요약 JSON 파싱 실패, 원본 content:", content.substring(0, 500));
@@ -213,7 +205,6 @@ ${transcript}`,
       keyPoints: [],
       decisions: [],
       actionItems: [],
-      participants: [],
     };
   }
 }
@@ -267,8 +258,7 @@ ID: ${m._id.toString()}
 개요: ${summary.overview || "없음"}
 주요 논의: ${summary.keyPoints?.join("; ") || "없음"}
 결정 사항: ${summary.decisions?.join("; ") || "없음"}
-실행 항목: ${summary.actionItems?.map((a) => `${a.task}(${a.assignee}, ${a.deadline})`).join("; ") || "없음"}
-참석자: ${summary.participants?.join(", ") || "없음"}`;
+실행 항목: ${summary.actionItems?.map((a) => `${a.task}(${a.assignee}, ${a.deadline})`).join("; ") || "없음"}`;
   });
 
   // 컨텍스트 크기 안전장치: 너무 크면 최신 회의록 우선 truncate

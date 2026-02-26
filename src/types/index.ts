@@ -25,7 +25,6 @@ export interface MeetingSummary {
   keyPoints: string[];
   decisions: string[];
   actionItems: ActionItem[];
-  participants: string[];
 }
 
 export type MeetingStatus =

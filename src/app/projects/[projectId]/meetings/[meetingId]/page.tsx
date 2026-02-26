@@ -58,6 +58,7 @@ export default async function MeetingDetailPage({
         </div>
 
         <MeetingDetail
+          meetingId={meetingId}
           summary={meeting.summary}
           transcript={meeting.transcript}
         />
