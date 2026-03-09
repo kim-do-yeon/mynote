@@ -29,5 +29,5 @@ export function useTimer() {
 
   const formatted = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 
-  return { seconds, formatted, start, stop, reset };
+  return { seconds, setSeconds, formatted, start, stop, reset };
 }

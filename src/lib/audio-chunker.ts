@@ -15,7 +15,7 @@
  * FormData 멀티파트 오버헤드(boundary, headers 등) 약 수백 바이트 고려
  * → Blob 자체는 3.5MB 이하로 제한하면 충분히 안전
  */
-const MAX_CHUNK_BLOB_BYTES = 1 * 1024 * 1024; // 1MB — 안전하게 Vercel 4.5MB 한도 이내
+const MAX_CHUNK_BLOB_BYTES = 3 * 1024 * 1024; // 3MB — FormData 오버헤드 포함 Vercel 4.5MB 한도 이내
 
 /**
  * 1초 단위 data chunk 배열을 크기 기반으로 Blob 배열로 묶기.
