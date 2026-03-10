@@ -25,7 +25,7 @@ import {
 import { TranscribeResponse } from "@/types";
 
 const MAX_RECORDING_SECONDS = 80 * 60; // 80분
-const MAX_RETRIES = 3; // 청크/요약 실패 시 최대 재시도 횟수
+const MAX_RETRIES = 5; // 청크/요약 실패 시 최대 재시도 횟수
 const RETRY_BASE_DELAY_MS = 2000; // 재시도 기본 대기시간 (지수 백오프)
 const CONCURRENCY = 8; // 동시 처리 수 (Vercel Hobby 10개 한도 내 여유분 확보)
 
@@ -36,8 +36,8 @@ function waitMs(ms: number): Promise<void> {
 
 /**
  * 동시성 제한 병렬 처리 (Promise pool 패턴).
- * 최대 concurrency개의 작업을 동시에 실행하며,
- * 하나가 실패하면 새 작업을 시작하지 않고 진행 중인 작업은 완료를 기다림.
+ * 최대 concurrency개의 작업을 동시에 실행.
+ * 개별 실패는 fn 내부에서 처리하며, pMap 자체는 항상 완료됨.
  */
 async function pMap<T>(
   items: T[],
@@ -45,27 +45,17 @@ async function pMap<T>(
   concurrency: number
 ): Promise<void> {
   let nextIndex = 0;
-  let hasError: Error | null = null;
 
   async function worker() {
-    while (nextIndex < items.length && !hasError) {
+    while (nextIndex < items.length) {
       const i = nextIndex++;
-      try {
-        await fn(items[i]);
-      } catch (err) {
-        if (!hasError) {
-          hasError = err instanceof Error ? err : new Error(String(err));
-        }
-        return;
-      }
+      await fn(items[i]);
     }
   }
 
   await Promise.all(
     Array.from({ length: Math.min(concurrency, items.length) }, () => worker())
   );
-
-  if (hasError) throw hasError;
 }
 
 type ProcessingState =
@@ -130,6 +120,7 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
     null
   );
   const [processLogs, setProcessLogs] = useState<string[]>([]);
+  const [skippedChunkCount, setSkippedChunkCount] = useState(0); // 전사 실패로 스킵된 구간 수
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   // ★ 실패 시 보존하는 처리 상태 (메모리)
@@ -526,9 +517,11 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
     const pendingIndices = Array.from({ length: totalChunks }, (_, i) => i)
       .filter((i) => !completedSet.has(i));
 
+    const skippedIndices: number[] = []; // 실패하여 스킵된 청크 인덱스
+
     addLog(`병렬 전사 시작: ${pendingIndices.length}개 구간 대기 (동시 ${CONCURRENCY}개)`);
 
-    /** 개별 청크 전사 (재시도 포함) */
+    /** 개별 청크 전사 (재시도 포함, 최종 실패 시 스킵) */
     const transcribeChunk = async (i: number) => {
       addLog(`구간 ${i + 1}/${totalChunks} 전사 시작...`);
       const file = new File([audioBlobs[i]], `chunk-${i}.${ext}`, { type: mime });
@@ -580,24 +573,30 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
             addLog(`  [${i + 1}] 실패 (${errMsg}), ${(delayMs / 1000).toFixed(0)}초 후 재시도...`);
             await waitMs(delayMs);
           } else {
-            addLog(`  [${i + 1}] ${MAX_RETRIES}회 시도 모두 실패: ${errMsg}`);
-            failedStepRef.current = "transcribing";
-            failedChunkIndexRef.current = i;
-            // ★ 실패 상태를 IndexedDB에 저장
-            await updateSession(projectId, {
-              transcripts: [...transcripts],
-              completedChunks: [...completedSet],
-              failedStep: "transcribing",
-              failedChunkIndex: i,
-            }).catch(() => {});
-            throw new Error(`${i + 1}번째 구간 처리 실패 (${MAX_RETRIES}회 재시도 후): ${errMsg}`);
+            // ★ 최종 실패: throw 대신 스킵 처리
+            addLog(`  [${i + 1}] ⚠ ${MAX_RETRIES}회 시도 모두 실패 → 스킵: ${errMsg}`);
+            skippedIndices.push(i);
+            // 진행률은 업데이트 (스킵도 "처리 완료"로 카운트)
+            completedCount = completedSet.size + skippedIndices.length;
+            setChunkProgress({ totalChunks, completedChunks: completedCount, currentStep: "transcribing" });
+            setProcessingMessage(`음성 변환 중... (${completedCount}/${totalChunks} 구간)`);
+            return; // 에러를 throw하지 않음 → pMap 계속 진행
           }
         }
       }
     };
 
-    // ★ 병렬 처리 실행
+    // ★ 병렬 처리 실행 (실패 청크는 스킵, 전체 중단 없음)
     await pMap(pendingIndices, transcribeChunk, CONCURRENCY);
+
+    // ★ 결과 집계
+    const skippedCount = skippedIndices.length;
+    const successCount = completedSet.size;
+
+    if (skippedCount > 0) {
+      addLog(`⚠ ${skippedCount}개 구간 전사 실패, 스킵됨 (구간: ${skippedIndices.map((i) => i + 1).join(", ")})`);
+      addLog(`${successCount}/${totalChunks}개 구간 성공 → 성공한 구간으로 회의록 작성`);
+    }
 
     const fullTranscript = transcripts
       .filter((t) => t.trim().length > 0 && t.trim() !== "[무음]")
@@ -606,7 +605,7 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
     addLog(`전체 전사 텍스트: ${fullTranscript.length}자`);
 
     if (!fullTranscript || fullTranscript.trim().length === 0) {
-      setError("음성을 인식할 수 없습니다. 더 선명하게 녹음해 주세요.");
+      setError("음성을 인식할 수 없습니다. 모든 구간의 전사에 실패했습니다. 더 선명하게 녹음해 주세요.");
       setState("error");
       return;
     }
@@ -616,14 +615,18 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
     // ★ 전사 완료 상태 IndexedDB에 저장
     await updateSession(projectId, { fullTranscript }).catch(() => {});
 
-    await runSummarization(fullTranscript, totalChunks);
+    await runSummarization(fullTranscript, totalChunks, skippedCount);
   };
 
   /** 요약 실행 */
-  const runSummarization = async (fullTranscript: string, totalChunks: number) => {
+  const runSummarization = async (fullTranscript: string, totalChunks: number, skippedCount: number = 0) => {
     setChunkProgress({ totalChunks, completedChunks: totalChunks, currentStep: "summarizing" });
     setProcessingMessage("회의록을 요약하고 있습니다...");
-    addLog("요약 생성 시작...");
+    if (skippedCount > 0) {
+      addLog(`⚠ ${skippedCount}/${totalChunks}개 구간 누락 상태로 요약 생성 시작...`);
+    } else {
+      addLog("요약 생성 시작...");
+    }
 
     const duration = recoveredDurationRef.current || timer.seconds;
 
@@ -680,7 +683,12 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
       throw new Error("요약 처리에 실패했습니다.");
     }
 
-    addLog("회의록 생성 완료!");
+    if (skippedCount > 0) {
+      addLog(`⚠ 회의록 생성 완료 (${skippedCount}개 구간 누락)`);
+    } else {
+      addLog("회의록 생성 완료!");
+    }
+    setSkippedChunkCount(skippedCount);
     setResult(summaryParsed.data);
     setState("completed");
     clearSavedState();
@@ -702,6 +710,7 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
     setResult(null);
     setChunkProgress(null);
     setProcessLogs([]);
+    setSkippedChunkCount(0);
     clearSavedState();
     recoveredRawChunksRef.current = [];
     recoveredMimeTypeRef.current = "";
@@ -998,6 +1007,16 @@ export default function AudioRecorder({ projectId }: AudioRecorderProps) {
             <p className="text-lg font-medium">회의록이 생성되었습니다!</p>
             <p className="text-sm text-muted mt-1">{result.title}</p>
           </div>
+          {skippedChunkCount > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-left">
+              <p className="text-sm text-amber-800 font-medium">
+                ⚠ {skippedChunkCount}개 구간의 음성 변환에 실패하여 해당 부분이 누락되었습니다.
+              </p>
+              <p className="text-xs text-amber-600 mt-1">
+                회의록은 성공한 구간의 내용을 기반으로 작성되었습니다.
+              </p>
+            </div>
+          )}
           <div className="bg-gray-50 rounded-lg p-4">
             <h3 className="font-bold text-sm mb-2">요약</h3>
             <p className="text-sm text-muted">{result.summary.overview}</p>
